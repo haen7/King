@@ -7,6 +7,7 @@
 #include <vector>
 #include <inttypes.h>
 #include <algorithm>
+#include <map>
 
 #include "img4tool.hpp"
 
@@ -37,7 +38,8 @@ enum class ECOMMAND
   READ_U64,
   DECRYPT_IMG4,
   HEXDUMP,
-  DUMPROM
+  DUMPROM,
+  SIGCHECK_PATCH
 };
 
 const int PAYLOAD_OFFSET_ARMV7 = 384;
@@ -968,6 +970,130 @@ void decryptIMG4(std::string FileName, std::string DecryptedKeyBag)
   cout << "[!] File succesfully decrypted and written to: " + FileName + "_decrypted" + "\n";
 }
 
+// Signiture check remover
+
+typedef std::vector<uint8_t>  dataType;
+
+struct DevConfig
+{
+  std::string version;
+  std::string cpid;
+  std::map <uint64_t, dataType> patches;
+};
+
+std::map <uint64_t, dataType> exploit_config(std::string SerialNumber)
+{
+  std::map <uint64_t, dataType> t7000_patches;
+  t7000_patches.insert(pair <uint64_t, dataType> (0x1000078B4, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  t7000_patches.insert(pair <uint64_t, dataType> (0x1000078C0, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  t7000_patches.insert(pair <uint64_t, dataType> (0x1000078E4, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  t7000_patches.insert(pair <uint64_t, dataType> (0x100007BAC, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+
+  std::map <uint64_t, dataType> s8000_patches;
+  s8000_patches.insert(pair <uint64_t, dataType> (0x100007924, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  s8000_patches.insert(pair <uint64_t, dataType> (0x10000792C, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  s8000_patches.insert(pair <uint64_t, dataType> (0x100007958, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  s8000_patches.insert(pair <uint64_t, dataType> (0x100007C9C, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+
+  std::map <uint64_t, dataType> t8011_patches;
+  t8011_patches.insert(pair <uint64_t, dataType> (0x100006df8, {0x21, 0x00, 0x80, 0x52,
+                                                                0xe1, 0xb7, 0x03, 0x39,
+                                                                0xe1, 0xb3, 0x03, 0x39,
+                                                                0xe1, 0xbb, 0x03, 0x39}));
+  t8011_patches.insert(pair <uint64_t, dataType> (0x100006e0c, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  t8011_patches.insert(pair <uint64_t, dataType> (0x100006e10, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  t8011_patches.insert(pair <uint64_t, dataType> (0x100006e14, {0x1f, 0x20, 0x03, 0xd5}));  /* nop */
+  t8011_patches.insert(pair <uint64_t, dataType> (0x10000f2d0, {0x00, 0x00, 0x80, 0xd2,
+                                                                0xc0, 0x03, 0x5f, 0xd6}));
+
+  std::vector <struct DevConfig> config = {
+    {"iBoot-1992.0.0.1.19", "7000", t7000_patches},
+    {"iBoot-2234.0.0.3.3",  "8000", s8000_patches},
+    {"iBoot-2234.0.0.2.22", "8000", s8000_patches},
+    {"iBoot-2234.0.0.2.22", "8003", s8000_patches},
+    {"iBoot-3135.0.0.2.3",  "8011", t8011_patches}
+  };
+
+  std::vector <struct DevConfig>::iterator itr;
+
+  for ( itr = config.begin(); itr < config.end(); ++itr)
+  {
+    if (SerialNumber.find(itr -> version) != std::string::npos)
+    {
+      return itr -> patches;
+    }
+  }
+
+  for ( itr = config.begin(); itr < config.end(); ++itr)
+  {
+    if (SerialNumber.find(itr -> cpid) != std::string::npos)
+    {
+      cout << "ERROR: CPID is compatible, but serial number string does not match.\n";
+      cout << "Make sure device is in SecureROM DFU Mode and not LLB/iBSS DFU Mode. Exiting.\n";
+      exit(1);
+    }
+  }
+
+  cout << "ERROR: This is not a compatible device. Exiting.\n";
+  //cout << "Right now, only the iPhone 6 is compatible.\n";
+  exit(1);
+}
+
+
+void sigCheckPatch()
+{
+  const int HOST2DEVICE = 0x21;
+  const int DEVICE2HOST = 0xA1;
+
+  const int DFU_DNLOAD = 1;
+  const int DFU_ABORT = 4;
+
+  DFU d;
+  d.acquire_device();
+
+  if (d.isExploited() == false)
+  {
+    cout << "[!] Device has to be exploited first!\n";
+    return;
+  }
+
+  auto SerialNumber = d.getSerialNumber();
+  d.release_device();
+
+  if (SerialNumber.find("PWND:[checkm8]") == std::string::npos)
+  {
+    cout << "Only devices pwned using checkm8 are supported.\n";
+    exit(1);
+  }
+
+  std::map <uint64_t,  dataType> config;
+
+  config = exploit_config(SerialNumber);
+
+  cout << "Applying patches...\n";
+
+  USBEXEC U(SerialNumber);
+
+  std::map <uint64_t, dataType>::iterator itr;
+
+  for (itr = config.begin(); itr != config.end(); ++itr)
+  {
+    U.write_memory(itr -> first, itr -> second );
+  }
+
+  cout << "Successfully applied patches\n";
+  cout << "Resetting device state\n";
+  cout << "* This will effectiveley disable pwned DFU Mode\n";
+  cout << "* Only the signature patches will remain\n";
+  // Send abort
+  d.ctrl_transfer(HOST2DEVICE, DFU_ABORT, 0, 0, 0, 0, 1000);
+  // Perform USB reset
+  d.usb_reset();
+  d.release_device();
+  cout << "Device is now ready to accept unsigned images/n";
+}
+
+
 ECOMMAND parseCommandLine(int argc, char *argv[])
 {
   if (argc < 2)
@@ -988,6 +1114,7 @@ ECOMMAND parseCommandLine(int argc, char *argv[])
             "file\n";
     cout << "hexdump address size                            - print hexdump\n";
     cout << "dump-rom                                        - print SecureROM\n";
+    cout << "sigcheck_patch                                  - remove signiture check\n";
     cout << "\n";
 
     return ECOMMAND::EXIT;
@@ -1037,6 +1164,10 @@ ECOMMAND parseCommandLine(int argc, char *argv[])
   else if (Command == "dump-rom")
   {
     return ECOMMAND::DUMPROM;
+  }
+  else if (Command == "sigcheck_patch")
+  {
+      return ECOMMAND::SIGCHECK_PATCH;
   }
 
   cout << "[!] Unknown command!\n";
@@ -1094,6 +1225,9 @@ int main(int argc, char *argv[])
     dumprom();
   }
   break;
+  case ECOMMAND::SIGCHECK_PATCH:
+    sigCheckPatch();
+    break;
   default:
     // Do nothing
     break;
